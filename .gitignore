@@ -2,3 +2,4 @@
 Cargo.lock
 .vscode/
 live_record.mp4
+live_record_*.h264
