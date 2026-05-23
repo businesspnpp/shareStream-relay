@@ -12,15 +12,16 @@
 //! receive everything from the moment they connect onward; they tolerate lag
 //! by dropping (broadcast::error::RecvError::Lagged is logged and skipped).
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
+    body::Body,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
-    http::StatusCode,
-    response::IntoResponse,
+    http::{header, StatusCode},
+    response::{Html, IntoResponse, Response},
     routing::get,
     Router,
 };
@@ -31,7 +32,7 @@ use tokio::{
     io::AsyncWriteExt,
     sync::{broadcast, Mutex},
 };
-use tower_http::{cors::CorsLayer, services::ServeFile, trace::TraceLayer};
+use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 const RECORDING_PATH: &str = "live_record.mp4";
 const BROADCAST_CAPACITY: usize = 256;
@@ -58,13 +59,11 @@ async fn main() {
     };
 
     let app = Router::new()
+        .route("/", get(index))
         .route("/health", get(|| async { "ok" }))
         .route("/ingest", get(ws_ingest))
         .route("/live", get(ws_live))
-        .route_service(
-            "/download/live_record.mp4",
-            ServeFile::new(PathBuf::from(RECORDING_PATH)),
-        )
+        .route("/download/live_record.mp4", get(download_recording))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -190,4 +189,46 @@ async fn handle_live(socket: WebSocket, state: AppState) {
 #[allow(dead_code)]
 async fn _unused_status_helper() -> StatusCode {
     StatusCode::OK
+}
+
+async fn index() -> Html<&'static str> {
+    Html(
+        "<!doctype html><meta charset=utf-8><title>shareStream-relay</title>\
+         <h1>shareStream-relay</h1>\
+         <ul>\
+         <li>WS  /ingest   &mdash; desktop streamer pushes here</li>\
+         <li>WS  /live     &mdash; browser viewers subscribe here</li>\
+         <li>GET /download/live_record.mp4 &mdash; last completed recording</li>\
+         <li>GET /health</li>\
+         </ul>",
+    )
+}
+
+async fn download_recording() -> Response {
+    use tokio::io::AsyncReadExt;
+    let mut file = match tokio::fs::File::open(RECORDING_PATH).await {
+        Ok(f) => f,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                "No recording yet. Start and stop a stream from the desktop client first.",
+            )
+                .into_response();
+        }
+    };
+    let mut buf = Vec::new();
+    if let Err(e) = file.read_to_end(&mut buf).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("read failed: {e}")).into_response();
+    }
+    (
+        [
+            (header::CONTENT_TYPE, "video/mp4"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"live_record.mp4\"",
+            ),
+        ],
+        Body::from(buf),
+    )
+        .into_response()
 }
