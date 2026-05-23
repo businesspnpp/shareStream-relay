@@ -50,6 +50,10 @@ struct DeviceEntry {
     tx: broadcast::Sender<Bytes>,
     /// Active recording file for the current session.
     recording: Arc<Mutex<Option<File>>>,
+    /// Most recent Annex-B chunk containing an IDR (NAL type 5) or SPS (NAL type 7).
+    /// Replayed to every newly-subscribed viewer so playback starts immediately
+    /// instead of waiting for the next periodic keyframe.
+    last_keyframe: Arc<Mutex<Option<Bytes>>>,
     /// True while a desktop is actively pushing frames.
     online: bool,
     /// Unix-ms of last frame received.
@@ -68,6 +72,35 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Scan an Annex-B buffer for an IDR (NAL type 5) or SPS (NAL type 7).
+/// Either marks a random-access point.
+fn contains_keyframe(buf: &[u8]) -> bool {
+    let n = buf.len();
+    let mut i = 0usize;
+    while i + 4 < n {
+        if buf[i] == 0 && buf[i + 1] == 0 {
+            let hdr = if buf[i + 2] == 1 {
+                i + 3
+            } else if buf[i + 2] == 0 && buf[i + 3] == 1 {
+                i + 4
+            } else {
+                i += 1;
+                continue;
+            };
+            if hdr < n {
+                let nal_type = buf[hdr] & 0x1F;
+                if nal_type == 5 || nal_type == 7 {
+                    return true;
+                }
+                i = hdr;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 fn recording_path(device_id: &str) -> String {
@@ -167,7 +200,7 @@ async fn handle_ingest(mut socket: WebSocket, state: AppState, device_id: String
         }
     };
 
-    let (tx, recording_arc) = {
+    let (tx, recording_arc, keyframe_arc) = {
         let mut devices = state.devices.write().await;
         let entry = devices.entry(device_id.clone()).or_insert_with(|| {
             let (tx, _) = broadcast::channel::<Bytes>(BROADCAST_CAPACITY);
@@ -175,6 +208,7 @@ async fn handle_ingest(mut socket: WebSocket, state: AppState, device_id: String
                 metadata: serde_json::json!({}),
                 tx,
                 recording: Arc::new(Mutex::new(None)),
+                last_keyframe: Arc::new(Mutex::new(None)),
                 online: false,
                 last_seen_ms: 0,
             }
@@ -182,7 +216,9 @@ async fn handle_ingest(mut socket: WebSocket, state: AppState, device_id: String
         entry.metadata = metadata;
         entry.online = true;
         entry.last_seen_ms = now_ms();
-        (entry.tx.clone(), entry.recording.clone())
+        // Drop any stale keyframe from the previous session.
+        *entry.last_keyframe.lock().await = None;
+        (entry.tx.clone(), entry.recording.clone(), entry.last_keyframe.clone())
     };
 
     let path = recording_path(&device_id);
@@ -211,6 +247,9 @@ async fn handle_ingest(mut socket: WebSocket, state: AppState, device_id: String
         match msg {
             Message::Binary(data) => {
                 let bytes = Bytes::from(data);
+                if contains_keyframe(&bytes) {
+                    *keyframe_arc.lock().await = Some(bytes.clone());
+                }
                 let _ = tx.send(bytes.clone());
                 if let Some(file) = recording_arc.lock().await.as_mut() {
                     if let Err(e) = file.write_all(&bytes).await {
@@ -253,8 +292,8 @@ async fn ws_live(
 }
 
 async fn handle_live(socket: WebSocket, state: AppState, device_id: String) {
-    let tx = match state.devices.read().await.get(&device_id) {
-        Some(e) => e.tx.clone(),
+    let (tx, primer) = match state.devices.read().await.get(&device_id) {
+        Some(e) => (e.tx.clone(), e.last_keyframe.clone()),
         None => {
             tracing::info!("viewer wanted unknown device {device_id}");
             let mut s = socket;
@@ -266,6 +305,11 @@ async fn handle_live(socket: WebSocket, state: AppState, device_id: String) {
     tracing::info!("viewer connected to {device_id}");
     let (mut sink, mut stream) = socket.split();
     let mut rx = tx.subscribe();
+
+    // Prime the new viewer with the most recent keyframe, if we have one.
+    if let Some(kf) = primer.lock().await.clone() {
+        let _ = sink.send(Message::Binary(kf.to_vec())).await;
+    }
 
     let send_task = tokio::spawn(async move {
         loop {
