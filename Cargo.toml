@@ -1,0 +1,21 @@
+[package]
+name = "sharestream-relay"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[dependencies]
+axum             = { version = "0.7", features = ["ws"] }
+tokio            = { version = "1.35", features = ["rt-multi-thread", "macros", "signal", "sync", "fs", "io-util", "net"] }
+tokio-stream     = "0.1"
+futures-util     = { version = "0.3", default-features = false, features = ["sink"] }
+tower-http       = { version = "0.5", features = ["cors", "fs", "trace"] }
+tracing          = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes            = "1"

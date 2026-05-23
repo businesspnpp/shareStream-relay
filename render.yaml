@@ -1,0 +1,12 @@
+# Render blueprint: spin up the relay as a single Web Service.
+services:
+  - type: web
+    name: sharestream-relay
+    runtime: rust
+    plan: free
+    buildCommand: cargo build --release
+    startCommand: ./target/release/sharestream-relay
+    envVars:
+      - key: RUST_LOG
+        value: sharestream_relay=info,tower_http=info
+    healthCheckPath: /health

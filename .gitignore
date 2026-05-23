@@ -1,0 +1,4 @@
+/target
+Cargo.lock
+.vscode/
+live_record.mp4
