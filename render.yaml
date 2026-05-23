@@ -6,6 +6,8 @@ services:
     plan: free
     buildCommand: cargo build --release
     startCommand: ./target/release/sharestream-relay
+    autoDeploy: true
+    branch: main
     envVars:
       - key: RUST_LOG
         value: sharestream_relay=info,tower_http=info
