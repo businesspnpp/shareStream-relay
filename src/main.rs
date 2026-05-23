@@ -3,12 +3,12 @@
 //! Single-process WebSocket relay:
 //!   * `GET  /ingest`            — desktop streamer connects here and pushes binary chunks.
 //!   * `GET  /live`              — browser viewers connect here; receive a broadcast fan-out.
-//!   * `GET  /download/live_record.mp4` — pulls the last completed recording.
+//!   * `GET  /download/live_record.h264` — pulls the last completed recording (raw Annex-B).
 //!   * `GET  /health`            — Render health probe.
 //!
 //! Architecture: one `tokio::sync::broadcast` channel per process. Ingest writes
 //! each binary frame both to the broadcast (for live viewers) and appended to
-//! `live_record.mp4` on disk (for post-session download). Viewers join late and
+//! `live_record.h264` on disk (for post-session download). Viewers join late and
 //! receive everything from the moment they connect onward; they tolerate lag
 //! by dropping (broadcast::error::RecvError::Lagged is logged and skipped).
 
@@ -34,7 +34,7 @@ use tokio::{
 };
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
-const RECORDING_PATH: &str = "live_record.mp4";
+const RECORDING_PATH: &str = "live_record.h264";
 const BROADCAST_CAPACITY: usize = 256;
 
 #[derive(Clone)]
@@ -63,7 +63,7 @@ async fn main() {
         .route("/health", get(|| async { "ok" }))
         .route("/ingest", get(ws_ingest))
         .route("/live", get(ws_live))
-        .route("/download/live_record.mp4", get(download_recording))
+        .route("/download/live_record.h264", get(download_recording))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -198,7 +198,7 @@ async fn index() -> Html<&'static str> {
          <ul>\
          <li>WS  /ingest   &mdash; desktop streamer pushes here</li>\
          <li>WS  /live     &mdash; browser viewers subscribe here</li>\
-         <li>GET /download/live_record.mp4 &mdash; last completed recording</li>\
+         <li>GET /download/live_record.h264 &mdash; last completed recording (raw Annex-B H.264)</li>\
          <li>GET /health</li>\
          </ul>",
     )
@@ -222,10 +222,10 @@ async fn download_recording() -> Response {
     }
     (
         [
-            (header::CONTENT_TYPE, "video/mp4"),
+            (header::CONTENT_TYPE, "video/h264"),
             (
                 header::CONTENT_DISPOSITION,
-                "attachment; filename=\"live_record.mp4\"",
+                "attachment; filename=\"live_record.h264\"",
             ),
         ],
         Body::from(buf),
