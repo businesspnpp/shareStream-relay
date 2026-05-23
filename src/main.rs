@@ -1,27 +1,32 @@
-//! shareStream-relay
+//! shareStream-relay (multi-device)
 //!
-//! Single-process WebSocket relay:
-//!   * `GET  /ingest`            — desktop streamer connects here and pushes binary chunks.
-//!   * `GET  /live`              — browser viewers connect here; receive a broadcast fan-out.
-//!   * `GET  /download/live_record.h264` — pulls the last completed recording (raw Annex-B).
-//!   * `GET  /health`            — Render health probe.
-//!
-//! Architecture: one `tokio::sync::broadcast` channel per process. Ingest writes
-//! each binary frame both to the broadcast (for live viewers) and appended to
-//! `live_record.h264` on disk (for post-session download). Viewers join late and
-//! receive everything from the moment they connect onward; they tolerate lag
-//! by dropping (broadcast::error::RecvError::Lagged is logged and skipped).
+//! Architecture:
+//!   * Multiple desktops can connect simultaneously, each identified by
+//!     `device_id` in the URL: `WS /ingest/:device_id`.
+//!   * On connect, the desktop's first message MUST be a text frame containing
+//!     a JSON metadata blob (hostname, IPs, OS, battery, …).
+//!   * The relay maintains an in-memory registry of devices and exposes
+//!     `GET /devices` for the browser viewer to enumerate.
+//!   * Browser viewers subscribe with `WS /live/:device_id` and receive that
+//!     device's broadcast fan-out.
+//!   * Each device's session is recorded to disk at `live_record_<id>.h264`
+//!     and served via `GET /download/:device_id`.
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::{
     body::Body,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
+        Path, State,
     },
     http::{header, StatusCode},
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Json, Response},
     routing::get,
     Router,
 };
@@ -30,17 +35,53 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::{
     fs::{File, OpenOptions},
     io::AsyncWriteExt,
-    sync::{broadcast, Mutex},
+    sync::{broadcast, Mutex, RwLock},
 };
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
-const RECORDING_PATH: &str = "live_record.h264";
 const BROADCAST_CAPACITY: usize = 256;
+const RECORDING_DIR: &str = ".";
+
+#[derive(Clone)]
+struct DeviceEntry {
+    /// Metadata blob from the desktop, served verbatim to viewers.
+    metadata: serde_json::Value,
+    /// Outgoing fan-out for live H.264 chunks.
+    tx: broadcast::Sender<Bytes>,
+    /// Active recording file for the current session.
+    recording: Arc<Mutex<Option<File>>>,
+    /// True while a desktop is actively pushing frames.
+    online: bool,
+    /// Unix-ms of last frame received.
+    last_seen_ms: u64,
+}
+
+type Registry = Arc<RwLock<HashMap<String, DeviceEntry>>>;
 
 #[derive(Clone)]
 struct AppState {
-    tx: broadcast::Sender<Bytes>,
-    recording: Arc<Mutex<Option<File>>>,
+    devices: Registry,
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn recording_path(device_id: &str) -> String {
+    let safe: String = device_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{}/live_record_{}.h264", RECORDING_DIR, safe)
 }
 
 #[tokio::main]
@@ -52,23 +93,21 @@ async fn main() {
         )
         .init();
 
-    let (tx, _rx) = broadcast::channel::<Bytes>(BROADCAST_CAPACITY);
     let state = AppState {
-        tx,
-        recording: Arc::new(Mutex::new(None)),
+        devices: Arc::new(RwLock::new(HashMap::new())),
     };
 
     let app = Router::new()
         .route("/", get(index))
         .route("/health", get(|| async { "ok" }))
-        .route("/ingest", get(ws_ingest))
-        .route("/live", get(ws_live))
-        .route("/download/live_record.h264", get(download_recording))
+        .route("/devices", get(list_devices))
+        .route("/ingest/:device_id", get(ws_ingest))
+        .route("/live/:device_id", get(ws_live))
+        .route("/download/:device_id", get(download_recording))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
-    // Render injects $PORT; default 8080 locally.
     let port: u16 = std::env::var("PORT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -85,36 +124,86 @@ async fn main() {
         .unwrap();
 }
 
-// ---- Ingest (desktop -> relay) -------------------------------------------
+// ---- Devices catalog ------------------------------------------------------
 
-async fn ws_ingest(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_ingest(socket, state))
+async fn list_devices(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let devices = state.devices.read().await;
+    let arr: Vec<serde_json::Value> = devices
+        .iter()
+        .map(|(id, e)| {
+            serde_json::json!({
+                "device_id": id,
+                "online": e.online,
+                "viewer_count": e.tx.receiver_count(),
+                "last_seen_ms": e.last_seen_ms,
+                "metadata": e.metadata,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "devices": arr }))
 }
 
-async fn handle_ingest(mut socket: WebSocket, state: AppState) {
-    tracing::info!("ingest client connected");
+// ---- Ingest (desktop -> relay) -------------------------------------------
 
-    // Truncate + open the recording file for this session.
-    let file = match OpenOptions::new()
+async fn ws_ingest(
+    ws: WebSocketUpgrade,
+    Path(device_id): Path<String>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_ingest(socket, state, device_id))
+}
+
+async fn handle_ingest(mut socket: WebSocket, state: AppState, device_id: String) {
+    tracing::info!("ingest connected: {device_id}");
+
+    let metadata: serde_json::Value = match socket.next().await {
+        Some(Ok(Message::Text(t))) => serde_json::from_str(&t).unwrap_or_else(|e| {
+            tracing::warn!("invalid metadata json from {device_id}: {e}");
+            serde_json::json!({})
+        }),
+        _ => {
+            tracing::warn!("ingest {device_id}: first frame was not text metadata");
+            serde_json::json!({})
+        }
+    };
+
+    let (tx, recording_arc) = {
+        let mut devices = state.devices.write().await;
+        let entry = devices.entry(device_id.clone()).or_insert_with(|| {
+            let (tx, _) = broadcast::channel::<Bytes>(BROADCAST_CAPACITY);
+            DeviceEntry {
+                metadata: serde_json::json!({}),
+                tx,
+                recording: Arc::new(Mutex::new(None)),
+                online: false,
+                last_seen_ms: 0,
+            }
+        });
+        entry.metadata = metadata;
+        entry.online = true;
+        entry.last_seen_ms = now_ms();
+        (entry.tx.clone(), entry.recording.clone())
+    };
+
+    let path = recording_path(&device_id);
+    match OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
-        .open(RECORDING_PATH)
+        .open(&path)
         .await
     {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::error!("cannot open recording file: {e}");
-            return;
+        Ok(f) => {
+            *recording_arc.lock().await = Some(f);
         }
-    };
-    *state.recording.lock().await = Some(file);
+        Err(e) => tracing::error!("cannot open recording {path}: {e}"),
+    }
 
     while let Some(msg) = socket.next().await {
         let msg = match msg {
             Ok(m) => m,
             Err(e) => {
-                tracing::warn!("ingest read error: {e}");
+                tracing::warn!("ingest {device_id} read error: {e}");
                 break;
             }
         };
@@ -122,16 +211,18 @@ async fn handle_ingest(mut socket: WebSocket, state: AppState) {
         match msg {
             Message::Binary(data) => {
                 let bytes = Bytes::from(data);
-
-                // Fan out to live viewers (ignore if no subscribers).
-                let _ = state.tx.send(bytes.clone());
-
-                // Append to on-disk recording.
-                if let Some(file) = state.recording.lock().await.as_mut() {
+                let _ = tx.send(bytes.clone());
+                if let Some(file) = recording_arc.lock().await.as_mut() {
                     if let Err(e) = file.write_all(&bytes).await {
                         tracing::warn!("recording write failed: {e}");
                     }
                 }
+                if let Some(entry) = state.devices.write().await.get_mut(&device_id) {
+                    entry.last_seen_ms = now_ms();
+                }
+            }
+            Message::Text(_) => {
+                // Allow late metadata updates (e.g. battery refresh).
             }
             Message::Close(_) => break,
             Message::Ping(p) => {
@@ -141,26 +232,41 @@ async fn handle_ingest(mut socket: WebSocket, state: AppState) {
         }
     }
 
-    // Flush recording on disconnect so /download serves a complete file.
-    if let Some(mut file) = state.recording.lock().await.take() {
+    if let Some(mut file) = recording_arc.lock().await.take() {
         let _ = file.flush().await;
         let _ = file.sync_all().await;
     }
-    tracing::info!("ingest client disconnected; recording flushed");
+    if let Some(entry) = state.devices.write().await.get_mut(&device_id) {
+        entry.online = false;
+    }
+    tracing::info!("ingest disconnected: {device_id}");
 }
 
 // ---- Live fan-out (relay -> browser viewers) ------------------------------
 
-async fn ws_live(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_live(socket, state))
+async fn ws_live(
+    ws: WebSocketUpgrade,
+    Path(device_id): Path<String>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_live(socket, state, device_id))
 }
 
-async fn handle_live(socket: WebSocket, state: AppState) {
-    tracing::info!("viewer connected");
-    let (mut sink, mut stream) = socket.split();
-    let mut rx = state.tx.subscribe();
+async fn handle_live(socket: WebSocket, state: AppState, device_id: String) {
+    let tx = match state.devices.read().await.get(&device_id) {
+        Some(e) => e.tx.clone(),
+        None => {
+            tracing::info!("viewer wanted unknown device {device_id}");
+            let mut s = socket;
+            let _ = s.close().await;
+            return;
+        }
+    };
 
-    // Outbound: forward broadcast chunks to this viewer.
+    tracing::info!("viewer connected to {device_id}");
+    let (mut sink, mut stream) = socket.split();
+    let mut rx = tx.subscribe();
+
     let send_task = tokio::spawn(async move {
         loop {
             match rx.recv().await {
@@ -178,40 +284,35 @@ async fn handle_live(socket: WebSocket, state: AppState) {
         }
     });
 
-    // Inbound: just drain (so close frames are handled).
     let recv_task = tokio::spawn(async move { while stream.next().await.is_some() {} });
 
     let _ = tokio::try_join!(send_task, recv_task);
-    tracing::info!("viewer disconnected");
-}
-
-// Server-side health endpoint used by Render returns 200 from the closure above.
-#[allow(dead_code)]
-async fn _unused_status_helper() -> StatusCode {
-    StatusCode::OK
+    tracing::info!("viewer disconnected from {device_id}");
 }
 
 async fn index() -> Html<&'static str> {
     Html(
         "<!doctype html><meta charset=utf-8><title>shareStream-relay</title>\
-         <h1>shareStream-relay</h1>\
+         <h1>shareStream-relay (multi-device)</h1>\
          <ul>\
-         <li>WS  /ingest   &mdash; desktop streamer pushes here</li>\
-         <li>WS  /live     &mdash; browser viewers subscribe here</li>\
-         <li>GET /download/live_record.h264 &mdash; last completed recording (raw Annex-B H.264)</li>\
+         <li>WS  /ingest/:device_id   &mdash; desktop pushes frames here</li>\
+         <li>WS  /live/:device_id     &mdash; browser viewers subscribe here</li>\
+         <li>GET /devices             &mdash; list of devices + metadata</li>\
+         <li>GET /download/:device_id &mdash; raw Annex-B H.264 recording</li>\
          <li>GET /health</li>\
          </ul>",
     )
 }
 
-async fn download_recording() -> Response {
+async fn download_recording(Path(device_id): Path<String>) -> Response {
     use tokio::io::AsyncReadExt;
-    let mut file = match tokio::fs::File::open(RECORDING_PATH).await {
+    let path = recording_path(&device_id);
+    let mut file = match tokio::fs::File::open(&path).await {
         Ok(f) => f,
         Err(_) => {
             return (
                 StatusCode::NOT_FOUND,
-                "No recording yet. Start and stop a stream from the desktop client first.",
+                format!("No recording yet for {device_id}."),
             )
                 .into_response();
         }
@@ -220,13 +321,11 @@ async fn download_recording() -> Response {
     if let Err(e) = file.read_to_end(&mut buf).await {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("read failed: {e}")).into_response();
     }
+    let disposition = format!("attachment; filename=\"live_record_{device_id}.h264\"");
     (
         [
-            (header::CONTENT_TYPE, "video/h264"),
-            (
-                header::CONTENT_DISPOSITION,
-                "attachment; filename=\"live_record.h264\"",
-            ),
+            (header::CONTENT_TYPE, "video/h264".to_string()),
+            (header::CONTENT_DISPOSITION, disposition),
         ],
         Body::from(buf),
     )
